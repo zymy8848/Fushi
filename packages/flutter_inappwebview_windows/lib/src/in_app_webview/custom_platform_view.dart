@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding, Ticker;
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/widgets.dart';
@@ -173,6 +174,124 @@ double surfaceRasterScale({
     return devicePixelRatio;
   }
   return scale;
+}
+
+double _snapAxisToPhysicalPixel(
+  double originLogical,
+  double axisScale,
+  double devicePixelRatio,
+) {
+  final double originPhys = originLogical * devicePixelRatio;
+  if (!originPhys.isFinite) return 0.0;
+  // D3D11 / OpenGL top-left fill rule includes pixel k iff
+  // originPhys <= k + 0.5 < originPhys + W, so the leftmost covered pixel is
+  // ceil(originPhys - 0.5). Subtracting 1e-6 keeps float64 origins that round
+  // to k + 0.5 in GPU float32 aligned to k, ensuring the snapped texture covers
+  // 100% of ClipRect pixels with zero 1px edge gap on either side.
+  final double snappedPhys = (originPhys - 0.5 - 1e-6).ceilToDouble();
+  final double deltaPhys = snappedPhys - originPhys;
+  if (deltaPhys.abs() < 1e-6) return 0.0;
+  return deltaPhys / (axisScale * devicePixelRatio);
+}
+
+/// 将平台视图 [Texture] 的绘制原点对齐到整数物理像素所需施加的本地逻辑偏移。
+///
+/// Windows 上 `Texture` 默认走 `FilterQuality.none`（`GL_NEAREST`）。在 125%/150%/175%
+/// 分数 DPI 下，弹窗外框（如 1 logical px = 1.5 physical px）会把 WebView 物理原点落在
+/// `k + 0.5` 半像素边界上；当纹理扩容到非 2 的幂容量（BUG-3913，如 1280×1024）时，
+/// GPU 插值器在像素中心 `k + 0.5` 处的 float32 舍入会在四边形对角线两侧分化，
+/// 左上三角出现周期性 4→5 复制与跳像素，视觉上表现为分辨率骤降。
+///
+/// 仅对正向轴对齐 2D 变换（可含祖先缩放如界面缩放 `FittedBox`）对齐；旋转、错切、
+/// 透视或退化变换返回 [Offset.zero]。
+@visibleForTesting
+Offset physicalPixelSnapOffset({
+  required Matrix4 transform,
+  required double devicePixelRatio,
+}) {
+  if (!devicePixelRatio.isFinite || devicePixelRatio <= 0) {
+    return Offset.zero;
+  }
+  final List<double> m = transform.storage;
+  if (m[3].abs() > 1e-6 ||
+      m[7].abs() > 1e-6 ||
+      (m[15] - 1.0).abs() > 1e-6) {
+    return Offset.zero;
+  }
+  if (m[1].abs() > 1e-6 || m[4].abs() > 1e-6) {
+    return Offset.zero;
+  }
+  final double sx = m[0];
+  final double sy = m[5];
+  if (!sx.isFinite || !sy.isFinite || sx <= 1e-6 || sy <= 1e-6) {
+    return Offset.zero;
+  }
+  final double dx = _snapAxisToPhysicalPixel(m[12], sx, devicePixelRatio);
+  final double dy = _snapAxisToPhysicalPixel(m[13], sy, devicePixelRatio);
+  if (dx == 0.0 && dy == 0.0) return Offset.zero;
+  return Offset(dx, dy);
+}
+
+class _PhysicalPixelSnap extends SingleChildRenderObjectWidget {
+  const _PhysicalPixelSnap({
+    super.key,
+    required this.devicePixelRatio,
+    required super.child,
+  });
+
+  final double devicePixelRatio;
+
+  @override
+  _RenderPhysicalPixelSnap createRenderObject(BuildContext context) {
+    return _RenderPhysicalPixelSnap(devicePixelRatio: devicePixelRatio);
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderPhysicalPixelSnap renderObject,
+  ) {
+    renderObject.devicePixelRatio = devicePixelRatio;
+  }
+}
+
+class _RenderPhysicalPixelSnap extends RenderProxyBox {
+  _RenderPhysicalPixelSnap({required double devicePixelRatio})
+      : _devicePixelRatio = devicePixelRatio;
+
+  double _devicePixelRatio;
+  Offset? _lastAppliedDelta;
+
+  set devicePixelRatio(double value) {
+    if (_devicePixelRatio == value) return;
+    _devicePixelRatio = value;
+    markNeedsPaint();
+  }
+
+  /// 若祖先 `RepaintBoundary` / `FadeTransition` / `Viewport` 移动导致全局物理坐标
+  /// 改变而本节点未重绘，主动触发一次重绘以更新子 [TextureBox] 的 `OffsetLayer.offset`。
+  void syncSnapIfNeeded() {
+    if (!attached || !hasSize) return;
+    final Offset nextDelta = physicalPixelSnapOffset(
+      transform: getTransformTo(null),
+      devicePixelRatio: _devicePixelRatio,
+    );
+    if (nextDelta != _lastAppliedDelta) {
+      markNeedsPaint();
+    }
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    final RenderBox? child = this.child;
+    if (child == null) return;
+    final Offset delta = physicalPixelSnapOffset(
+      transform: getTransformTo(null),
+      devicePixelRatio: _devicePixelRatio,
+    );
+    _lastAppliedDelta = delta;
+    context.paintChild(child, offset + delta);
+  }
 }
 
 /// setSize 去抖判定（TODO-428/420）。
@@ -485,6 +604,7 @@ class CustomPlatformView extends StatefulWidget {
 class _CustomPlatformViewState extends State<CustomPlatformView>
     with SingleTickerProviderStateMixin {
   final GlobalKey _key = GlobalKey();
+  final GlobalKey _textureSnapKey = GlobalKey();
 
   /// BUG-1419：WebView2 侧的鼠标键状态（`VirtualKeyState`，in_app_webview.h）是
   /// **粘滞增量**位集——只有 `setPointerButton` 的 down/up 会翻转它，没有任何自愈。
@@ -774,7 +894,12 @@ class _CustomPlatformViewState extends State<CustomPlatformView>
   /// 纹理像素与屏幕像素 1:1，容量里多出来的部分被裁掉，不拉伸、不错位。
   Widget _buildTextureLayout(
       BuildContext context, TextureLayout? layout, Widget? texture) {
-    if (layout == null) return texture!;
+    final Widget snapped = _PhysicalPixelSnap(
+      key: _textureSnapKey,
+      devicePixelRatio: View.of(context).devicePixelRatio,
+      child: texture!,
+    );
+    if (layout == null) return snapped;
     return ClipRect(
       child: OverflowBox(
         alignment: Alignment.topLeft,
@@ -782,7 +907,7 @@ class _CustomPlatformViewState extends State<CustomPlatformView>
         maxWidth: layout.logicalWidth,
         minHeight: layout.logicalHeight,
         maxHeight: layout.logicalHeight,
-        child: texture,
+        child: snapped,
       ),
     );
   }
@@ -850,6 +975,14 @@ class _CustomPlatformViewState extends State<CustomPlatformView>
     });
   }
 
+  void _syncTexturePixelSnap() {
+    final RenderObject? ro =
+        _textureSnapKey.currentContext?.findRenderObject();
+    if (ro is _RenderPhysicalPixelSnap) {
+      ro.syncSnapIfNeeded();
+    }
+  }
+
   void _reportWidgetPositionIfChanged() {
     if (!_controller.value.isInitialized) return;
     final BuildContext? context = _key.currentContext;
@@ -858,6 +991,7 @@ class _CustomPlatformViewState extends State<CustomPlatformView>
       return;
     }
     _reportSurfaceScaleIfSettled(context, box);
+    _syncTexturePixelSnap();
     final Offset position = box.localToGlobal(Offset.zero);
     final double scale =
         widget.scaleFactor ?? View.of(context).devicePixelRatio;

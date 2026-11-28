@@ -200,4 +200,45 @@ void main() {
       reason: 'Texture 必须经容量布局包裹，否则引擎把整张容量纹理压进 widget 盒子',
     );
   });
+
+  test('Texture 绘制原点对齐整数物理像素，避免半像素边界下 GL_NEAREST 周期性错采', () {
+    final String snapFn = _functionBody(
+      dart,
+      'Offset physicalPixelSnapOffset(',
+    );
+    expect(snapFn, contains('devicePixelRatio'));
+    final String snapAxis = _functionBody(
+      dart,
+      'double _snapAxisToPhysicalPixel(',
+    );
+    expect(snapAxis, contains('.ceilToDouble()'));
+    expect(snapAxis, contains('devicePixelRatio'));
+
+    final String layout = _functionBody(dart, 'Widget _buildTextureLayout(');
+    expect(layout, contains('_PhysicalPixelSnap('));
+
+    final String renderClass = _functionBody(
+      dart,
+      'class _RenderPhysicalPixelSnap extends RenderProxyBox',
+    );
+    expect(renderClass, contains('physicalPixelSnapOffset('));
+    expect(renderClass, contains('offset + delta'));
+    expect(renderClass, contains('syncSnapIfNeeded('));
+
+    final String reportPos = _functionBody(
+      dart,
+      'void _reportWidgetPositionIfChanged(',
+    );
+    final int syncCall = reportPos.indexOf('_syncTexturePixelSnap()');
+    final int earlyReturn = reportPos.indexOf(
+      'if (position == _lastReportedPosition',
+    );
+    expect(syncCall, isNonNegative);
+    expect(earlyReturn, isNonNegative);
+    expect(
+      syncCall,
+      lessThan(earlyReturn),
+      reason: '祖先 RepaintBoundary 移动后必须先核对对齐再按位置决定是否提前返回',
+    );
+  });
 }

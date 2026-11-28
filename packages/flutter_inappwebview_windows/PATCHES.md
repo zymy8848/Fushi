@@ -212,3 +212,26 @@ verified at runtime on this machine.
   defaults to `false`) are never muted.
 - Guards: `fushi/test/widgets/inappwebview_windows_native_guards_test.dart` and
   `fushi/test/media/video/web_video_shared_cookie_jar_test.dart`.
+
+## Snap WebView texture paint origin to integer physical pixels (2026-11-28)
+
+- `custom_platform_view.dart` renders the shared WebView2 `Texture` with
+  `FilterQuality.none` (`GL_NEAREST`) by default so texels stay crisp 1:1. At
+  fractional DPI (125%/150%/175%), layout offsets such as a 1 logical px popup
+  border (`1.5` physical px at 150% DPI) place the `Texture` origin on a
+  half-pixel boundary `k + 0.5`. Once the shared texture expands to a
+  non-power-of-two capacity dimension (BUG-3913, e.g. `1280x1024`, `768`,
+  `1536`), ANGLE D3D11 / GPU barycentric float32 interpolation splits across the
+  quad anti-diagonal: one triangle suffers periodic texel duplication and
+  skipping (e.g. 4->5 in X for `1280`, 2->3 in Y for `768`/`1536`), making
+  WebView content look severely downscaled while surrounding Flutter UI stays
+  sharp.
+- `custom_platform_view.dart` now wraps the `Texture` inside `_buildTextureLayout`
+  (preserving `ClipRect` + top-left `OverflowBox`) with `_PhysicalPixelSnap`
+  using `physicalPixelSnapOffset` and `_snapAxisToPhysicalPixel`
+  (`ceil(originPhys - 0.5 - 1e-6)` to match the D3D11/OpenGL top-left fill rule
+  with zero uncovered edge pixels), plus post-frame `_syncTexturePixelSnap()`
+  in `_reportWidgetPositionIfChanged()` so moving an ancestor
+  `RepaintBoundary` / `FadeTransition` / `Viewport` also re-snaps.
+- Tests & CI guard: `test/physical_pixel_snap_test.dart` and
+  `fushi/test/build/webview_texture_capacity_guard_test.dart`.
